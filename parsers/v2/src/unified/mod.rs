@@ -2189,6 +2189,25 @@ impl GuidedState {
                         continue;
                     }
 
+                    // Response means the prompt already opened visible content, so
+                    // reasoning markers are literal prose.  Keep that prose out of
+                    // the payload buffer even when the guided JSON follows in the
+                    // same chunk; otherwise the literal prefix makes the array no
+                    // longer look like a payload and the call is emitted as text.
+                    // Whitespace stays buffered because it may still be the leading
+                    // structural whitespace of a payload split across chunks.
+                    if !self.reasoning_enabled
+                        && self.json.trim().is_empty()
+                        && let Some(payload_at) = self.input.find(['{', '['])
+                        && !self.input[..payload_at].trim().is_empty()
+                    {
+                        let mut visible = std::mem::take(&mut self.json);
+                        visible.push_str(&self.input[..payload_at]);
+                        push_run(&mut output, Kind::Text, &visible);
+                        self.input.drain(..payload_at);
+                        continue;
+                    }
+
                     // A reasoning opener ANYWHERE ahead means the thought has not
                     // started yet and whatever precedes it is ordinary visible text —
                     // not the beginning of the JSON payload. Requiring a
@@ -2387,6 +2406,17 @@ impl GuidedState {
                                 &self.reasoning.strip_text(&self.input[..visible_len]),
                             );
                             self.post_payload_text_started = true;
+                        } else if !self.reasoning_enabled && self.json.trim().is_empty() {
+                            // Preserve only whitespace until we know whether it is
+                            // leading JSON. Any other Response-prefix byte is visible
+                            // content, never the start of a reasoning span or payload.
+                            let mut visible = std::mem::take(&mut self.json);
+                            visible.push_str(&self.input[..visible_len]);
+                            if visible.trim().is_empty() {
+                                self.json = visible;
+                            } else {
+                                push_run(&mut output, Kind::Text, &visible);
+                            }
                         } else {
                             self.json.push_str(&self.input[..visible_len]);
                         }
@@ -3002,7 +3032,7 @@ fn convert_guided_call(call: GuidedToolCall) -> Option<GuidedCall> {
     // block, golden `arguments: {}` — so voiding it here made guided disagree with
     // native on an identical shape and made a parameterless tool uncallable. What
     // makes an element invalid is a missing `name` (required on GuidedToolCall);
-    // that still voids the whole array, per `31.c` / `51.b`.
+    // that still voids the whole array, per `31-3` / `51.b`.
     let arguments = match (call.parameters, call.arguments) {
         // PRESENT but not an object is a malformed call, the same judgement the
         // NAMED path makes on its whole payload: arguments that are a string or
@@ -3397,6 +3427,102 @@ mod tests {
             name: name.map(str::to_string),
             arguments: arguments.to_string(),
         })
+    }
+
+    fn guided_events_at_every_split(
+        family: &str,
+        input: &str,
+        starting_state: UnifiedParserStartingState,
+    ) -> Vec<Vec<UnifiedEvent>> {
+        let tools = vec![Tool {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: serde_json::json!({"type":"object"}),
+            strict: None,
+        }];
+        input
+            .char_indices()
+            .map(|(split, _)| split)
+            .chain(std::iter::once(input.len()))
+            .map(|split| {
+                let mut parser = create_unified_parser_for_family(family, &tools).unwrap();
+                parser
+                    .initialize_request(UnifiedParserInit {
+                        starting_state,
+                        tool_output_mode: UnifiedToolOutputMode::GuidedJson { named_tool: None },
+                        invalid_guided_payload: InvalidGuidedPayloadPolicy::RecoverAsText,
+                        ..UnifiedParserInit::default()
+                    })
+                    .unwrap();
+                let mut events = parser.push(&input[..split]).unwrap();
+                events.extend(parser.push(&input[split..]).unwrap());
+                let finish = parser.finish().unwrap();
+                assert!(
+                    finish.events.is_empty(),
+                    "{family} split at {split} deferred a complete guided call until finish"
+                );
+                assemble(&events)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn response_prefill_keeps_literal_reasoning_markers_out_of_guided_json_at_every_split() {
+        let payload = r#"[{"name":"get_weather","arguments":{"city":"Paris"}}]"#;
+        for (family, prefix) in [
+            ("qwen3", "I mean <think>self literal</think>"),
+            ("kimi_k2", "I mean <think>self literal</think>"),
+        ] {
+            let input = format!("{prefix}{payload}");
+            let want = vec![
+                UnifiedEvent::Text {
+                    text: prefix.to_string(),
+                },
+                UnifiedEvent::ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city":"Paris"}),
+                },
+            ];
+            for (index, got) in
+                guided_events_at_every_split(family, &input, UnifiedParserStartingState::Response)
+                    .into_iter()
+                    .enumerate()
+            {
+                assert_eq!(got, want, "{family} split {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_tool_boundary_recovers_prefilled_reasoning_into_guided_json_at_every_split() {
+        let payload = r#"[{"name":"get_weather","arguments":{"city":"Paris"}}]"#;
+        for (family, input) in [
+            (
+                "qwen3",
+                format!("thinking <tool_call>{payload}</tool_call>"),
+            ),
+            (
+                "kimi_k2",
+                format!("thinking <|tool_calls_section_begin|>{payload}<|tool_calls_section_end|>"),
+            ),
+        ] {
+            let want = vec![
+                UnifiedEvent::Reasoning {
+                    text: "thinking ".to_string(),
+                },
+                UnifiedEvent::ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city":"Paris"}),
+                },
+            ];
+            for (index, got) in
+                guided_events_at_every_split(family, &input, UnifiedParserStartingState::Reasoning)
+                    .into_iter()
+                    .enumerate()
+            {
+                assert_eq!(got, want, "{family} split {index}");
+            }
+        }
     }
 
     #[test]
