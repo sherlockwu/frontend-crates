@@ -1637,6 +1637,27 @@ fn json_payload_started(buf: &str) -> bool {
     matches!(buf.trim_start().as_bytes().first(), Some(b'{') | Some(b'['))
 }
 
+/// First opening brace/bracket whose suffix is valid JSON so far.
+///
+/// Response-prefilled output may quote brackets as ordinary prose before the
+/// guided payload. A syntactically invalid candidate such as `[docs]` remains
+/// visible text; an incomplete valid prefix remains buffered until its payload
+/// finishes streaming.
+fn guided_json_start(input: &str) -> Option<usize> {
+    input
+        .char_indices()
+        .filter_map(|(at, ch)| matches!(ch, '{' | '[').then_some(at))
+        .find(|&at| {
+            let mut values =
+                serde_json::Deserializer::from_str(&input[at..]).into_iter::<serde_json::Value>();
+            match values.next() {
+                Some(Ok(_)) => true,
+                Some(Err(error)) => error.is_eof(),
+                None => false,
+            }
+        })
+}
+
 fn json_payload_kind(payload: &str) -> &'static str {
     match serde_json::from_str::<serde_json::Value>(payload) {
         Ok(serde_json::Value::Object(_)) => "object",
@@ -2182,8 +2203,15 @@ impl GuidedState {
                     // decided by chunking (`I6`).
                     if !self.content_routed
                         && !self.payload_emitted
-                        && (json_payload_started(&self.json)
-                            || (self.json.trim().is_empty() && json_payload_started(&self.input)))
+                        && if self.reasoning_enabled {
+                            json_payload_started(&self.json)
+                                || (self.json.trim().is_empty()
+                                    && json_payload_started(&self.input))
+                        } else {
+                            guided_json_start(&self.json) == Some(0)
+                                || (self.json.trim().is_empty()
+                                    && guided_json_start(&self.input) == Some(0))
+                        }
                     {
                         self.mode = GuidedMode::VisibleOnly;
                         continue;
@@ -2196,14 +2224,34 @@ impl GuidedState {
                     // longer look like a payload and the call is emitted as text.
                     // Whitespace stays buffered because it may still be the leading
                     // structural whitespace of a payload split across chunks.
-                    if !self.reasoning_enabled
-                        && self.json.trim().is_empty()
-                        && let Some(payload_at) = self.input.find(['{', '['])
-                        && !self.input[..payload_at].trim().is_empty()
-                    {
-                        let visible = std::mem::take(&mut self.json);
-                        push_run(&mut output, Kind::Text, &visible);
-                        self.input.drain(..payload_at);
+                    if !self.reasoning_enabled && !self.payload_emitted {
+                        let mut combined = std::mem::take(&mut self.json);
+                        combined.push_str(&self.input);
+                        let Some(payload_at) = guided_json_start(&combined) else {
+                            self.json = combined;
+                            self.input.clear();
+                            break;
+                        };
+                        if !flush && combined[payload_at..].len() == 1 {
+                            // A lone `[` can begin JSON or quoted prose. Keep it until
+                            // the next byte distinguishes `[docs]` from a call array.
+                            self.json = combined;
+                            self.input.clear();
+                            break;
+                        }
+                        if payload_at == 0 {
+                            self.json.clear();
+                            continue;
+                        }
+                        if let Some((0, marker_len)) =
+                            self.control_marker_at(&combined, Some(payload_at), &[], flush)
+                        {
+                            self.stripped_markup = true;
+                            self.input = combined[marker_len..].to_string();
+                            continue;
+                        }
+                        push_run(&mut output, Kind::Text, &combined[..payload_at]);
+                        self.input = combined[payload_at..].to_string();
                         continue;
                     }
 
@@ -3455,11 +3503,7 @@ mod tests {
                     .unwrap();
                 let mut events = parser.push(&input[..split]).unwrap();
                 events.extend(parser.push(&input[split..]).unwrap());
-                let finish = parser.finish().unwrap();
-                assert!(
-                    finish.events.is_empty(),
-                    "{family} split at {split} deferred a complete guided call until finish"
-                );
+                events.extend(parser.finish().unwrap().events);
                 assemble(&events)
             })
             .collect()
@@ -3468,10 +3512,7 @@ mod tests {
     #[test]
     fn response_prefill_keeps_literal_reasoning_markers_out_of_guided_json_at_every_split() {
         let payload = r#"[{"name":"get_weather","arguments":{"city":"Paris"}}]"#;
-        for (family, prefix) in [
-            ("qwen3", "I mean <think>self literal</think>"),
-            ("kimi_k2", "I mean <think>self literal</think>"),
-        ] {
+        for prefix in ["I mean <think>self literal</think>", "See [docs] before "] {
             let input = format!("{prefix}{payload}");
             let want = vec![
                 UnifiedEvent::Text {
@@ -3483,11 +3524,11 @@ mod tests {
                 },
             ];
             for (index, got) in
-                guided_events_at_every_split(family, &input, UnifiedParserStartingState::Response)
+                guided_events_at_every_split("qwen3", &input, UnifiedParserStartingState::Response)
                     .into_iter()
                     .enumerate()
             {
-                assert_eq!(got, want, "{family} split {index}");
+                assert_eq!(got, want, "qwen3 split {index}: {prefix}");
             }
         }
     }
