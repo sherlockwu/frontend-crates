@@ -367,14 +367,6 @@ pub(crate) trait InvokeEmitter {
         tool_index: usize,
     ) -> anyhow::Result<Option<ToolCallDelta>>;
 
-    /// An internal end-of-call marker after a parsed invoke. The public delta
-    /// shape stays vLLM-compatible: an empty nameless delta carries no user
-    /// data, but lets assemblers distinguish a validated streamed call from an
-    /// interrupted provisional one.
-    fn finish_invoke(&mut self, _tool_index: usize) -> Option<ToolCallDelta> {
-        None
-    }
-
     /// The model-emitted id for a call already parsed at `tool_index`, when
     /// this family's grammar carries one. Mirrors
     /// [`crate::unified::UnifiedParser::tool_call_id`] one layer down, so a
@@ -1094,9 +1086,6 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 self.buffer.drain(..end);
                 if let Some(delta) = emitted {
                     out.push_call(delta);
-                    if let Some(terminal) = self.emitter.finish_invoke(self.next_index) {
-                        out.push_call(terminal);
-                    }
                     self.next_index += 1;
                     self.uncommitted_block.clear();
                     if self.spec.invoke_latch == InvokeLatch::IfEmitted {
@@ -1222,9 +1211,6 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                             "stream recovered a complete bare invoke"
                         );
                         out.push_call(delta);
-                        if let Some(terminal) = self.emitter.finish_invoke(self.next_index) {
-                            out.push_call(terminal);
-                        }
                         self.next_index += 1;
                         self.suppress_normal_text =
                             self.spec.bare_recovery_latch == BareRecoveryLatch::Set;

@@ -63,7 +63,6 @@ pub(crate) struct Qwen3Emitter {
     config: XmlParserConfig,
     tools: Vec<ToolDefinition>,
     partial: Option<PartialStringArgument>,
-    terminal_pending: bool,
 }
 
 /// The only Qwen XML prefix that can safely stream before the parameter closes:
@@ -75,6 +74,7 @@ struct PartialStringArgument {
     value_start: usize,
     emitted_raw: usize,
     emitted_json: String,
+    header_emitted: bool,
     stopped: bool,
 }
 
@@ -97,18 +97,9 @@ impl InvokeEmitter for Qwen3Emitter {
                 emitted_raw: 0,
                 emitted_json: emitted_json.clone(),
                 stopped: false,
+                header_emitted: false,
             });
-            self.terminal_pending = true;
-            return Ok(Some(ToolCallDelta {
-                tool_index,
-                name: Some(
-                    invoke[FUNCTION_START.len()..invoke.find('>').expect("header checked")]
-                        .trim()
-                        .trim_matches('"')
-                        .to_string(),
-                ),
-                arguments: emitted_json,
-            }));
+            return self.parse_partial_invoke(invoke, tool_index);
         }
 
         let partial = self.partial.as_mut().expect("initialized above");
@@ -159,8 +150,22 @@ impl InvokeEmitter for Qwen3Emitter {
             return Ok(None);
         }
         let raw = &value[leading..leading + end];
+        if !partial.header_emitted {
+            partial.header_emitted = true;
+            return Ok(Some(ToolCallDelta {
+                tool_index,
+                name: Some(
+                    invoke[FUNCTION_START.len()..invoke.find('>').expect("header checked")]
+                        .trim()
+                        .trim_matches('"')
+                        .to_string(),
+                ),
+                arguments: partial.emitted_json.clone(),
+            }));
+        }
         let escaped = json_string_fragment(raw);
         partial.emitted_raw += leading + end;
+        let arguments = escaped.clone();
         partial.emitted_json.push_str(&escaped);
         if entity < safe_end {
             partial.stopped = true;
@@ -168,7 +173,7 @@ impl InvokeEmitter for Qwen3Emitter {
         Ok(Some(ToolCallDelta {
             tool_index,
             name: None,
-            arguments: escaped,
+            arguments,
         }))
     }
 
@@ -191,8 +196,14 @@ impl InvokeEmitter for Qwen3Emitter {
         let arguments =
             reorder_arguments(&call.function.arguments, &source_parameter_order(invoke));
         let partial = self.partial.take();
+        let streamed = partial
+            .as_ref()
+            .is_some_and(|partial| partial.header_emitted);
         let arguments = if let Some(partial) = &partial {
-            if partial.tool_index == tool_index && arguments.starts_with(&partial.emitted_json) {
+            if streamed
+                && partial.tool_index == tool_index
+                && arguments.starts_with(&partial.emitted_json)
+            {
                 arguments[partial.emitted_json.len()..].to_string()
             } else {
                 arguments
@@ -202,25 +213,15 @@ impl InvokeEmitter for Qwen3Emitter {
         };
         Ok(Some(ToolCallDelta {
             tool_index,
-            name: partial.is_none().then_some(call.function.name),
+            // The streaming opener already supplied the name. The close carries
+            // only the argument suffix, matching OpenAI delta semantics.
+            name: (!streamed).then_some(call.function.name),
             arguments,
         }))
     }
 
-    fn finish_invoke(&mut self, tool_index: usize) -> Option<ToolCallDelta> {
-        if !std::mem::take(&mut self.terminal_pending) {
-            return None;
-        }
-        Some(ToolCallDelta {
-            tool_index,
-            name: None,
-            arguments: String::new(),
-        })
-    }
-
     fn reset(&mut self) {
         self.partial = None;
-        self.terminal_pending = false;
     }
 }
 
@@ -237,7 +238,6 @@ pub(crate) fn qwen3_scanner(tools: &[Tool]) -> WrappedBlockScanner<Qwen3Emitter>
             config: XmlParserConfig::default(),
             tools: tools.iter().map(ToolDefinition::from).collect(),
             partial: None,
-            terminal_pending: false,
         },
     )
 }
@@ -454,8 +454,24 @@ mod tests {
             ],
         );
         assert_eq!(out.normal_text, "");
-        assert!(!out.calls.is_empty());
+        assert_eq!(out.calls.len(), 2);
         assert!(out.coalesce_calls().calls.is_empty());
+    }
+
+    #[test]
+    fn parameter_header_without_any_value_never_assembles_a_call() {
+        let input = "<tool_call><function=get_weather><parameter=location>";
+        for split in (0..=input.len()).filter(|&index| input.is_char_boundary(index)) {
+            let out = parse_chunks(&weather_tools(), &[&input[..split], &input[split..]]);
+            assert!(
+                out.calls.is_empty(),
+                "split {split} emitted without a value"
+            );
+            assert!(
+                out.coalesce_calls().calls.is_empty(),
+                "split {split} assembled an unfinished call"
+            );
+        }
     }
 
     #[test]
@@ -609,9 +625,14 @@ mod tests {
     #[test]
     fn bare_string_parameter_streams_before_function_close() {
         let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
-        let early = parser
-            .push("<function=get_weather><parameter=location>Paris")
-            .expect("push");
+        assert!(
+            parser
+                .push("<function=get_weather><parameter=location>")
+                .expect("header")
+                .calls
+                .is_empty()
+        );
+        let early = parser.push("Paris").expect("push");
         assert!(early.calls.iter().any(|call| call.name.is_some()));
         assert!(
             early
@@ -624,7 +645,7 @@ mod tests {
             closed
                 .calls
                 .iter()
-                .any(|call| call.name.is_none() && call.arguments.is_empty())
+                .any(|call| call.arguments.ends_with("\"}"))
         );
     }
 
@@ -655,21 +676,5 @@ mod tests {
                 .collect::<String>(),
             r#"{"location":"Paris & Lyon"}"#
         );
-    }
-
-    #[test]
-    fn truncated_string_call_streams_partial_but_never_completes() {
-        let malformed = "<tool_call><function=get_weather><parameter=location>Paris with a long unfinished value";
-        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
-        let mut out = ToolParseResult::default();
-        for character in malformed.chars() {
-            out.append(parser.push(&character.to_string()).unwrap());
-        }
-        assert!(parser.finish().unwrap().calls.is_empty());
-        assert!(
-            !out.calls.is_empty(),
-            "streaming-first must expose progress"
-        );
-        assert!(out.coalesce_calls().calls.is_empty());
     }
 }
