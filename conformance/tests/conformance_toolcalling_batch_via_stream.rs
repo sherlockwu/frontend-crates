@@ -272,21 +272,26 @@ fn parse_stream_result(
     result.append(parser.finish()?);
     Ok(EngineResult {
         normal_text: result.normal_text.clone(),
-        calls: assemble_trait_calls(result),
+        calls: assemble_trait_calls(result, family),
     })
 }
 
-fn assemble_trait_calls(result: ToolParseResult) -> Vec<(String, Value)> {
+fn assemble_trait_calls(result: ToolParseResult, family: &str) -> Vec<(String, Value)> {
     let mut names = BTreeMap::<usize, String>::new();
     let mut args = BTreeMap::<usize, String>::new();
+    let mut complete = BTreeMap::<usize, bool>::new();
     for ToolCallDelta {
         tool_index,
         name,
         arguments,
+        ..
     } in result.calls
     {
+        if name.is_none() && arguments.is_empty() {
+            complete.insert(tool_index, true);
+        }
         if let Some(name) = name {
-            names.entry(tool_index).or_default().push_str(&name);
+            names.entry(tool_index).or_insert(name);
         }
         args.entry(tool_index).or_default().push_str(&arguments);
     }
@@ -294,8 +299,16 @@ fn assemble_trait_calls(result: ToolParseResult) -> Vec<(String, Value)> {
         .into_iter()
         .map(|(idx, name)| {
             let raw = args.remove(&idx).unwrap_or_default();
+            if family == "qwen3_coder"
+                && complete.get(&idx) != Some(&true)
+                && raw.starts_with('{')
+                && serde_json::from_str::<Value>(&raw).is_err()
+            {
+                return None;
+            }
             let value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
-            (name, value)
+            Some((name, value))
         })
+        .flatten()
         .collect()
 }

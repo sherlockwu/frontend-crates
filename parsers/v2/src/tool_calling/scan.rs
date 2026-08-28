@@ -350,11 +350,30 @@ pub(crate) struct ReasoningSpec {
 /// owned field is the ordinary way to do that — no `RefCell` needed, since
 /// parsing and the later lookup never run at the same time.
 pub(crate) trait InvokeEmitter {
+    /// Emit an append-safe update while an invoke is still open. Families that
+    /// cannot prove a fragment will survive their final typing leave this as a
+    /// no-op and continue to emit only at the invoke close.
+    fn parse_partial_invoke(
+        &mut self,
+        _invoke: &str,
+        _tool_index: usize,
+    ) -> anyhow::Result<Option<ToolCallDelta>> {
+        Ok(None)
+    }
+
     fn parse_invoke(
         &mut self,
         invoke: &str,
         tool_index: usize,
     ) -> anyhow::Result<Option<ToolCallDelta>>;
+
+    /// An internal end-of-call marker after a parsed invoke. The public delta
+    /// shape stays vLLM-compatible: an empty nameless delta carries no user
+    /// data, but lets assemblers distinguish a validated streamed call from an
+    /// interrupted provisional one.
+    fn finish_invoke(&mut self, _tool_index: usize) -> Option<ToolCallDelta> {
+        None
+    }
 
     /// The model-emitted id for a call already parsed at `tool_index`, when
     /// this family's grammar carries one. Mirrors
@@ -975,6 +994,14 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     self.buffer.drain(..start);
                 }
                 let Some(end) = self.invoke_end_at(&self.buffer, flush) else {
+                    if !flush
+                        && let Some(delta) = self
+                            .emitter
+                            .parse_partial_invoke(&self.buffer, self.next_index)?
+                    {
+                        out.push_call(delta);
+                        continue;
+                    }
                     if flush {
                         // Reviewer-caught regression: `invoke_end_at`
                         // returning `None` at flush does NOT always mean
@@ -1067,6 +1094,9 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 self.buffer.drain(..end);
                 if let Some(delta) = emitted {
                     out.push_call(delta);
+                    if let Some(terminal) = self.emitter.finish_invoke(self.next_index) {
+                        out.push_call(terminal);
+                    }
                     self.next_index += 1;
                     self.uncommitted_block.clear();
                     if self.spec.invoke_latch == InvokeLatch::IfEmitted {
@@ -1164,6 +1194,14 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     // A bare invoke (no wrapper) is recovered only once its close
                     // has streamed; otherwise wait for more input.
                     let Some(end) = self.invoke_end_at(&self.buffer, flush) else {
+                        if !flush
+                            && let Some(delta) = self
+                                .emitter
+                                .parse_partial_invoke(&self.buffer, self.next_index)?
+                        {
+                            out.push_call(delta);
+                            continue;
+                        }
                         if flush {
                             tracing::warn!(
                                 why = %format!("{}_incomplete_bare_invoke", self.spec.family),
@@ -1184,6 +1222,9 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                             "stream recovered a complete bare invoke"
                         );
                         out.push_call(delta);
+                        if let Some(terminal) = self.emitter.finish_invoke(self.next_index) {
+                            out.push_call(terminal);
+                        }
                         self.next_index += 1;
                         self.suppress_normal_text =
                             self.spec.bare_recovery_latch == BareRecoveryLatch::Set;

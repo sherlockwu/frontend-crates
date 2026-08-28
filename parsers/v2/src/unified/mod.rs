@@ -600,19 +600,21 @@ pub fn assemble(deltas: &[UnifiedParserEvent]) -> Vec<UnifiedEvent> {
     // fragments of two interleaved calls cannot merge, and carrying each call's
     // position so it stays where its FIRST delta landed.
     let mut out: Vec<UnifiedEvent> = Vec::new();
-    let mut calls: BTreeMap<usize, (usize, String)> = BTreeMap::new();
+    let mut calls: BTreeMap<usize, (usize, String, usize, bool)> = BTreeMap::new();
     for delta in merged {
         match delta {
             UnifiedParserEvent::Reasoning(text) => out.push(UnifiedEvent::Reasoning { text }),
             UnifiedParserEvent::Text(text) => out.push(UnifiedEvent::Text { text }),
             UnifiedParserEvent::ToolCall(call) => {
-                let (pos, raw) = calls.entry(call.tool_index).or_insert_with(|| {
-                    out.push(UnifiedEvent::ToolCall {
-                        name: String::new(),
-                        arguments: serde_json::Value::Null,
+                let terminal = call.name.is_none() && call.arguments.is_empty();
+                let (pos, raw, fragments, complete) =
+                    calls.entry(call.tool_index).or_insert_with(|| {
+                        out.push(UnifiedEvent::ToolCall {
+                            name: String::new(),
+                            arguments: serde_json::Value::Null,
+                        });
+                        (out.len() - 1, String::new(), 0, false)
                     });
-                    (out.len() - 1, String::new())
-                });
                 raw.push_str(&call.arguments);
                 if let Some(incoming) = call.name
                     && let UnifiedEvent::ToolCall { name, .. } = &mut out[*pos]
@@ -620,11 +622,25 @@ pub fn assemble(deltas: &[UnifiedParserEvent]) -> Vec<UnifiedEvent> {
                 {
                     *name = incoming;
                 }
+                *fragments += 1;
+                *complete |= terminal;
             }
         }
     }
 
-    for (pos, raw) in calls.into_values() {
+    let mut incomplete_positions = Vec::new();
+    for (pos, raw, fragments, complete) in calls.into_values() {
+        // A Qwen native fragment starts a JSON object but cannot form a valid
+        // value until the function closes. Do not turn that live-only prefix
+        // into the existing malformed-payload `{}` fallback at final assembly.
+        if !complete
+            && fragments > 1
+            && raw.starts_with('{')
+            && serde_json::from_str::<serde_json::Value>(&raw).is_err()
+        {
+            incomplete_positions.push(pos);
+            continue;
+        }
         if let UnifiedEvent::ToolCall { arguments, .. } = &mut out[pos] {
             // Best-effort (P3): a malformed payload must not take down the turn, but
             // it is NOT discarded silently — `{}` alone is indistinguishable from a
@@ -641,6 +657,9 @@ pub fn assemble(deltas: &[UnifiedParserEvent]) -> Vec<UnifiedEvent> {
                 serde_json::json!({})
             });
         }
+    }
+    for pos in incomplete_positions.into_iter().rev() {
+        out.remove(pos);
     }
     out
 }
@@ -2684,6 +2703,11 @@ impl GuidedState {
                              streamed; it cannot be withdrawn"
                         );
                     }
+                    out.push(UnifiedParserEvent::ToolCall(ToolCallDelta {
+                        tool_index: index,
+                        name: None,
+                        arguments: String::new(),
+                    }));
                 }
                 // Valid but never committed — a parameterless call, or one whose
                 // name closed too late to beat its own payload.
@@ -3594,6 +3618,17 @@ mod tests {
         let out = assemble(&[call(0, Some("f"), "not json")]);
         assert_eq!(
             out,
+            vec![UnifiedEvent::ToolCall {
+                name: "f".into(),
+                arguments: serde_json::json!({}),
+            }]
+        );
+    }
+
+    #[test]
+    fn assemble_keeps_a_malformed_one_shot_call() {
+        assert_eq!(
+            assemble(&[call(0, Some("f"), r#"{"x":"#)]),
             vec![UnifiedEvent::ToolCall {
                 name: "f".into(),
                 arguments: serde_json::json!({}),

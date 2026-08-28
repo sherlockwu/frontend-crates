@@ -321,6 +321,7 @@ fn emitted_from_result(result: ToolParseResult) -> Vec<EmittedDelta> {
                  tool_index,
                  name,
                  arguments,
+                 ..
              }| EmittedDelta {
                 index: tool_index,
                 id: false,

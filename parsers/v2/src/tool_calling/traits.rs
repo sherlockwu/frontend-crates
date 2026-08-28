@@ -67,25 +67,32 @@ impl ToolParseResult {
         self.calls.append(&mut other.calls);
     }
 
-    /// Merge multiple deltas for the same tool call into one complete item.
+    /// Merge multiple deltas for the same tool call into one item.
     ///
     /// This is primarily used by test helpers and batch adapters that delegate
     /// through the incremental parser lifecycle.
     pub fn coalesce_calls(mut self) -> Self {
-        let mut merged = BTreeMap::<usize, ToolCallDelta>::new();
+        let mut merged = BTreeMap::<usize, (ToolCallDelta, usize, bool)>::new();
         let mut order = Vec::new();
 
         for call in self.calls {
             match merged.entry(call.tool_index) {
                 btree_map::Entry::Vacant(entry) => {
                     order.push(call.tool_index);
-                    entry.insert(call);
+                    entry.insert((call, 1, false));
                 }
                 btree_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
+                    let named = call.name.is_some();
+                    let terminal = call.name.is_none() && call.arguments.is_empty();
+                    let (existing, fragments, complete) = entry.get_mut();
                     if existing.name.is_none() {
                         existing.name = call.name;
                     }
+                    if named {
+                        *fragments += 1;
+                    }
+                    *fragments += 1;
+                    *complete |= terminal;
                     existing.arguments.push_str(&call.arguments);
                 }
             }
@@ -94,6 +101,15 @@ impl ToolParseResult {
         self.calls = order
             .into_iter()
             .filter_map(|tool_index| merged.remove(&tool_index))
+            // Qwen repeats its name when `</function>` validates a provisional
+            // stream. A single-name, unterminated JSON prefix has no close.
+            .filter(|(call, fragments, complete)| {
+                *complete
+                    || *fragments == 1
+                    || !call.arguments.starts_with('{')
+                    || serde_json::from_str::<Value>(&call.arguments).is_ok()
+            })
+            .map(|(call, _, _)| call)
             .collect();
         self
     }

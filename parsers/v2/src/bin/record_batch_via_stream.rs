@@ -161,6 +161,7 @@ fn calls_from_parse_result(result: ToolParseResult) -> Vec<(String, String)> {
         tool_index,
         name,
         arguments,
+        ..
     } in result.calls
     {
         if let Some(name) = name {

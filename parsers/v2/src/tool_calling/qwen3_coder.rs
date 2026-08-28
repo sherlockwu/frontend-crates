@@ -20,7 +20,7 @@
 
 use crate::tool_calling::scan::{
     BareRecoveryLatch, InvokeEmitter, InvokeLatch, WrappedBlockScanner, WrappedBlockSpec,
-    reorder_arguments,
+    marker_prefix_suffix_len, reorder_arguments,
 };
 use crate::tool_calling::v1core::{ToolDefinition, XmlParserConfig, parse_tool_call_block};
 
@@ -62,9 +62,116 @@ fn spec() -> WrappedBlockSpec {
 pub(crate) struct Qwen3Emitter {
     config: XmlParserConfig,
     tools: Vec<ToolDefinition>,
+    partial: Option<PartialStringArgument>,
+    terminal_pending: bool,
+}
+
+/// The only Qwen XML prefix that can safely stream before the parameter closes:
+/// the first schema-guaranteed string property. `emitted_json` is exactly what
+/// the final batch serializer must begin with, so the terminal delta can append
+/// only its suffix without duplicating argument bytes.
+struct PartialStringArgument {
+    tool_index: usize,
+    value_start: usize,
+    emitted_raw: usize,
+    emitted_json: String,
+    stopped: bool,
 }
 
 impl InvokeEmitter for Qwen3Emitter {
+    fn parse_partial_invoke(
+        &mut self,
+        invoke: &str,
+        tool_index: usize,
+    ) -> anyhow::Result<Option<ToolCallDelta>> {
+        if self.partial.is_none() {
+            let Some((parameter, value_start)) =
+                first_streamable_string_parameter(invoke, &self.tools)
+            else {
+                return Ok(None);
+            };
+            let emitted_json = format!("{{{}:\"", serde_json::to_string(&parameter)?);
+            self.partial = Some(PartialStringArgument {
+                tool_index,
+                value_start,
+                emitted_raw: 0,
+                emitted_json: emitted_json.clone(),
+                stopped: false,
+            });
+            self.terminal_pending = true;
+            return Ok(Some(ToolCallDelta {
+                tool_index,
+                name: Some(
+                    invoke[FUNCTION_START.len()..invoke.find('>').expect("header checked")]
+                        .trim()
+                        .trim_matches('"')
+                        .to_string(),
+                ),
+                arguments: emitted_json,
+            }));
+        }
+
+        let partial = self.partial.as_mut().expect("initialized above");
+        if partial.tool_index != tool_index || partial.stopped {
+            return Ok(None);
+        }
+        let Some(value) = invoke.get(partial.value_start + partial.emitted_raw..) else {
+            return Ok(None);
+        };
+        let value = value
+            .find("</parameter>")
+            .map(|end| &value[..end])
+            .unwrap_or(value);
+        let safe_end = value.len() - marker_prefix_suffix_len(value, ["</parameter>"]);
+        let safe = &value[..safe_end];
+        let entity = safe.find('&').unwrap_or(safe.len());
+        let safe = &safe[..entity];
+        if entity < safe_end && safe.is_empty() {
+            partial.stopped = true;
+            return Ok(None);
+        }
+        let first_non_whitespace = safe
+            .char_indices()
+            .find(|(_, character)| !character.is_whitespace())
+            .map(|(index, _)| index);
+        let Some(first_non_whitespace) = first_non_whitespace else {
+            if entity < safe_end {
+                partial.stopped = true;
+            }
+            return Ok(None);
+        };
+        // The batch parser trims XML values. Discard only leading whitespace;
+        // trailing whitespace stays buffered until a later non-whitespace byte
+        // proves it belongs inside the final string.
+        let leading = if partial.emitted_raw == 0 {
+            first_non_whitespace
+        } else {
+            0
+        };
+        let safe = &safe[first_non_whitespace..];
+        let end = safe
+            .char_indices()
+            .rev()
+            .find(|(_, character)| !character.is_whitespace())
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(0);
+        if end == 0 {
+            return Ok(None);
+        }
+        let raw = &value[leading..leading + end];
+        let escaped = json_string_fragment(raw);
+        partial.emitted_raw += leading + end;
+        partial.emitted_json.push_str(&escaped);
+        if entity < safe_end {
+            partial.stopped = true;
+        }
+        Ok(Some(ToolCallDelta {
+            tool_index,
+            name: None,
+            arguments: escaped,
+        }))
+    }
+
     fn parse_invoke(
         &mut self,
         invoke: &str,
@@ -83,11 +190,37 @@ impl InvokeEmitter for Qwen3Emitter {
         };
         let arguments =
             reorder_arguments(&call.function.arguments, &source_parameter_order(invoke));
+        let partial = self.partial.take();
+        let arguments = if let Some(partial) = &partial {
+            if partial.tool_index == tool_index && arguments.starts_with(&partial.emitted_json) {
+                arguments[partial.emitted_json.len()..].to_string()
+            } else {
+                arguments
+            }
+        } else {
+            arguments
+        };
         Ok(Some(ToolCallDelta {
             tool_index,
-            name: Some(call.function.name),
+            name: partial.is_none().then_some(call.function.name),
             arguments,
         }))
+    }
+
+    fn finish_invoke(&mut self, tool_index: usize) -> Option<ToolCallDelta> {
+        if !std::mem::take(&mut self.terminal_pending) {
+            return None;
+        }
+        Some(ToolCallDelta {
+            tool_index,
+            name: None,
+            arguments: String::new(),
+        })
+    }
+
+    fn reset(&mut self) {
+        self.partial = None;
+        self.terminal_pending = false;
     }
 }
 
@@ -103,8 +236,43 @@ pub(crate) fn qwen3_scanner(tools: &[Tool]) -> WrappedBlockScanner<Qwen3Emitter>
         Qwen3Emitter {
             config: XmlParserConfig::default(),
             tools: tools.iter().map(ToolDefinition::from).collect(),
+            partial: None,
+            terminal_pending: false,
         },
     )
+}
+
+/// Return the first parameter only when its schema fixes it to a string. There
+/// can be no preceding typed values in the JSON object, so its prefix is safe.
+fn first_streamable_string_parameter(
+    invoke: &str,
+    tools: &[ToolDefinition],
+) -> Option<(String, usize)> {
+    let header_end = invoke.find('>')?;
+    let name = invoke[FUNCTION_START.len()..header_end]
+        .trim()
+        .trim_matches('"')
+        .trim();
+    let tool = tools.iter().find(|tool| tool.name == name)?;
+    let parameter_start = header_end + 1 + invoke[header_end + 1..].find(PARAMETER_START)?;
+    let parameter_header = parameter_start + PARAMETER_START.len();
+    let parameter_end = parameter_header + invoke[parameter_header..].find('>')?;
+    let parameter = invoke[parameter_header..parameter_end]
+        .trim()
+        .trim_matches('"')
+        .trim();
+    let schema = tool
+        .parameters
+        .as_ref()?
+        .get("properties")?
+        .get(parameter)?;
+    (schema.get("type").and_then(serde_json::Value::as_str) == Some("string"))
+        .then(|| (parameter.to_string(), parameter_end + 1))
+}
+
+fn json_string_fragment(text: &str) -> String {
+    let encoded = serde_json::to_string(text).expect("serializing a string cannot fail");
+    encoded[1..encoded.len() - 1].to_string()
 }
 
 /// Stream parser for Qwen3-Coder XML tool calls.
@@ -202,6 +370,7 @@ mod tests {
             ],
         );
         assert_eq!(out.normal_text, "");
+        let out = out.coalesce_calls();
         assert_eq!(out.calls.len(), 1);
         assert_eq!(out.calls[0].tool_index, 0);
         assert_eq!(out.calls[0].name.as_deref(), Some("get_weather"));
@@ -235,6 +404,7 @@ mod tests {
             ],
         );
         assert_eq!(out.normal_text, "I will check that. ");
+        let out = out.coalesce_calls();
         assert_eq!(out.calls.len(), 1);
         assert_eq!(out.calls[0].arguments, r#"{"location":"NYC"}"#);
     }
@@ -275,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_incomplete_function_at_eof() {
+    fn truncated_string_function_exposes_only_an_incomplete_delta() {
         let out = parse_chunks(
             &weather_tools(),
             &[
@@ -284,7 +454,8 @@ mod tests {
             ],
         );
         assert_eq!(out.normal_text, "");
-        assert!(out.calls.is_empty());
+        assert!(!out.calls.is_empty());
+        assert!(out.coalesce_calls().calls.is_empty());
     }
 
     #[test]
@@ -332,10 +503,173 @@ mod tests {
                 " </function> </tool_call>",
             ],
         );
+        let out = out.coalesce_calls();
         assert_eq!(out.calls.len(), 1);
         assert_eq!(
             out.calls[0].arguments,
             r#"{"path":"/app/x.go","old_str":"foo","new_str":"bar","command":"str_replace"}"#
         );
+    }
+
+    fn stream_every_char(tools: &[Tool], input: &str) -> ToolParseResult {
+        let mut parser = Qwen3CoderToolStreamParser::new(tools);
+        let mut out = ToolParseResult::default();
+        for character in input.chars() {
+            out.append(parser.push(&character.to_string()).expect("push"));
+        }
+        out.append(parser.finish().expect("finish"));
+        out
+    }
+
+    #[test]
+    fn streams_string_arguments_before_function_close_at_every_char_boundary() {
+        let input = "<tool_call><function=get_weather><parameter=location>Montréal \"café\" \\ path with substantial remaining content</parameter>still-open</function></tool_call>";
+        let baseline = parse_chunks(&weather_tools(), &[input]).coalesce_calls();
+        assert_eq!(
+            baseline.calls[0].arguments,
+            r#"{"location":"Montréal \"café\" \\ path with substantial remaining content"}"#
+        );
+
+        for split in (0..=input.len()).filter(|&index| input.is_char_boundary(index)) {
+            let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+            let mut out = ToolParseResult::default();
+            out.append(parser.push(&input[..split]).expect("first push"));
+            out.append(parser.push(&input[split..]).expect("second push"));
+            out.append(parser.finish().expect("finish"));
+            assert_eq!(
+                out.coalesce_calls(),
+                baseline,
+                "split at byte {split} changed the completed call"
+            );
+        }
+
+        let close = input.find("</function>").unwrap();
+        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+        let mut before_close = ToolParseResult::default();
+        for character in input[..close].chars() {
+            before_close.append(parser.push(&character.to_string()).expect("push"));
+        }
+        assert!(
+            before_close.calls.iter().any(|call| call.name.is_some()),
+            "name-bearing delta must arrive before </function>: {before_close:?}"
+        );
+        let before_parameter_close = input.find("</parameter>").unwrap();
+        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+        let mut during_value = ToolParseResult::default();
+        for character in input[..before_parameter_close - 20].chars() {
+            during_value.append(parser.push(&character.to_string()).expect("push"));
+        }
+        let emitted_arguments: String = during_value
+            .calls
+            .iter()
+            .map(|call| call.arguments.as_str())
+            .collect();
+        assert!(
+            emitted_arguments.contains("café"),
+            "content must stream with substantial value remaining: {during_value:?}"
+        );
+        let out = stream_every_char(&weather_tools(), input);
+        let fragments: Vec<_> = out
+            .calls
+            .iter()
+            .filter(|call| !call.arguments.is_empty())
+            .collect();
+        assert!(
+            fragments.len() >= 2,
+            "expected multiple argument fragments, got {fragments:?}"
+        );
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| !fragment.arguments.contains("</parameter>")),
+            "parameter marker leaked into arguments: {fragments:?}"
+        );
+        assert_eq!(out.coalesce_calls(), baseline);
+    }
+
+    #[test]
+    fn defers_non_string_parameter_until_function_close() {
+        let tools = vec![Tool {
+            name: "set_count".to_string(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer" } }
+            }),
+            strict: None,
+        }];
+        let mut parser = Qwen3CoderToolStreamParser::new(&tools);
+        let open = "<tool_call><function=set_count><parameter=count>42</parameter>";
+        assert!(parser.push(open).unwrap().calls.is_empty());
+        let closed = parser.push("</function></tool_call>").unwrap();
+        assert_eq!(closed.calls.len(), 1);
+        assert_eq!(closed.calls[0].arguments, r#"{"count":42}"#);
+    }
+
+    #[test]
+    fn bare_string_parameter_streams_before_function_close() {
+        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+        let early = parser
+            .push("<function=get_weather><parameter=location>Paris")
+            .expect("push");
+        assert!(early.calls.iter().any(|call| call.name.is_some()));
+        assert!(
+            early
+                .calls
+                .iter()
+                .any(|call| call.arguments.contains("Paris"))
+        );
+        let closed = parser.push("</parameter></function>").expect("close");
+        assert!(
+            closed
+                .calls
+                .iter()
+                .any(|call| call.name.is_none() && call.arguments.is_empty())
+        );
+    }
+
+    #[test]
+    fn defers_html_entities_until_complete_typing() {
+        let input = "<tool_call><function=get_weather><parameter=location>Paris &amp; Lyon</parameter></function></tool_call>";
+        let entity = input.find('&').unwrap();
+        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+        let mut before_entity = ToolParseResult::default();
+        for character in input[..entity].chars() {
+            before_entity.append(parser.push(&character.to_string()).expect("push"));
+        }
+        let emitted: String = before_entity
+            .calls
+            .iter()
+            .map(|call| call.arguments.as_str())
+            .collect();
+        assert!(emitted.contains("Paris"));
+
+        before_entity.append(parser.push(&input[entity..]).expect("push"));
+        before_entity.append(parser.finish().expect("finish"));
+        assert_eq!(
+            before_entity
+                .coalesce_calls()
+                .calls
+                .into_iter()
+                .map(|call| call.arguments)
+                .collect::<String>(),
+            r#"{"location":"Paris & Lyon"}"#
+        );
+    }
+
+    #[test]
+    fn truncated_string_call_streams_partial_but_never_completes() {
+        let malformed = "<tool_call><function=get_weather><parameter=location>Paris with a long unfinished value";
+        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+        let mut out = ToolParseResult::default();
+        for character in malformed.chars() {
+            out.append(parser.push(&character.to_string()).unwrap());
+        }
+        assert!(parser.finish().unwrap().calls.is_empty());
+        assert!(
+            !out.calls.is_empty(),
+            "streaming-first must expose progress"
+        );
+        assert!(out.coalesce_calls().calls.is_empty());
     }
 }
