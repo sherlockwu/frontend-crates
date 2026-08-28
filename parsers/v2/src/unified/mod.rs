@@ -2201,8 +2201,7 @@ impl GuidedState {
                         && let Some(payload_at) = self.input.find(['{', '['])
                         && !self.input[..payload_at].trim().is_empty()
                     {
-                        let mut visible = std::mem::take(&mut self.json);
-                        visible.push_str(&self.input[..payload_at]);
+                        let visible = std::mem::take(&mut self.json);
                         push_run(&mut output, Kind::Text, &visible);
                         self.input.drain(..payload_at);
                         continue;
