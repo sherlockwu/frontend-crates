@@ -1,6 +1,6 @@
 {
-  "snapshot": "20260827_110017",
-  "created_pt": "2026-08-27 11:00:17 America/Los_Angeles",
+  "snapshot": "20260828_142406",
+  "created_pt": "2026-08-28 14:24:06 America/Los_Angeles",
   "crates": {
     "dynamo-parsers": "8.2.0",
     "dynamo-parsers-v2": "0.3.4"
@@ -257,33 +257,33 @@
     },
     {
       "path": "unified/vllm_python-0.25.1.patch1.tar.gz",
-      "sha256": "8386306659ab51fff33274ba7a0db8fbb59bae2f16289ae0e0ae4e6c488c5c5f",
-      "size": 866
+      "sha256": "903c3e2d8adeef993d35d17b2fb2e662092fdea701a243dc89d79cc2c943686c",
+      "size": 869
     },
     {
       "path": "unified/vllm_python-0.25.1.tar.gz",
-      "sha256": "ac45a91593eb85a694321e86216eceeeb6134108a0aed7e352231910c930aa2a",
-      "size": 9365
+      "sha256": "d287f1e61bd15096c9ae12e9b082461da51b0694b68127684eb429e47e49bf12",
+      "size": 9659
     },
     {
       "path": "unified/vllm_python-0.26.0.tar.gz",
-      "sha256": "7a4a72acc4cb2c60bdccce9fc126473b4e2d80adf56e90a1b8aa5b8afb8d2c5f",
-      "size": 9688
+      "sha256": "2955bb6b931511ac052d673b1166649efe7e4da52ae35dd7361ec8a5923090dc",
+      "size": 9714
     },
     {
       "path": "unified/vllm_rust-0.25.1.patch1.tar.gz",
-      "sha256": "bdd4c62c18965704e90e7f4a9c47d029bdcd9562ee83f80a5e41759987367873",
-      "size": 924
+      "sha256": "ef7fec41a434bbfd2bcfb1105504ca80c43a9f43d635f106301e8e1816210a05",
+      "size": 925
     },
     {
       "path": "unified/vllm_rust-0.25.1.tar.gz",
-      "sha256": "0ef327ee87ac8df71dd8bee069ba33561cd4fc06486acb99298e73f1cac8ff9a",
-      "size": 10472
+      "sha256": "ef8038fca3843984094b1421382ff9dc0ae0563832084c1ddcf7341d27ff2ba9",
+      "size": 10838
     },
     {
       "path": "unified/vllm_rust-0.26.0.tar.gz",
-      "sha256": "81e468b820afb37af850146a6d1c044ef146c726edc132706de8b506d9045fd5",
-      "size": 10941
+      "sha256": "d34266871fe548c9c90a0b8b4f095fd058c68abaec377e24df8b652a6b530ba2",
+      "size": 10961
     }
   ]
 }
