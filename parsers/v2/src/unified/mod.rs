@@ -2454,9 +2454,6 @@ impl GuidedState {
                             );
                             self.post_payload_text_started = true;
                         } else if !self.reasoning_enabled && self.json.trim().is_empty() {
-                            // Preserve only whitespace until we know whether it is
-                            // leading JSON. Any other Response-prefix byte is visible
-                            // content, never the start of a reasoning span or payload.
                             let mut visible = std::mem::take(&mut self.json);
                             visible.push_str(&self.input[..visible_len]);
                             if visible.trim().is_empty() {
