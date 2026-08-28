@@ -2239,6 +2239,11 @@ impl GuidedState {
                             self.input.clear();
                             break;
                         }
+                        if combined[..payload_at].trim().is_empty() {
+                            self.json = combined;
+                            self.input.clear();
+                            break;
+                        }
                         if payload_at == 0 {
                             self.json.clear();
                             continue;
