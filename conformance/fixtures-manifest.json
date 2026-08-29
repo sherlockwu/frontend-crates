@@ -1,6 +1,6 @@
 {
-  "snapshot": "20260828_172218",
-  "created_pt": "2026-08-28 17:22:18 America/Los_Angeles",
+  "snapshot": "20260828_184836",
+  "created_pt": "2026-08-28 18:48:36 America/Los_Angeles",
   "crates": {
     "dynamo-parsers": "8.2.0",
     "dynamo-parsers-v2": "0.4.0"
@@ -239,6 +239,11 @@
       "path": "unified/dynamo_v2-0.3.4.tar.gz",
       "sha256": "19b6f45dc869378a86af35a4a06395cbb6fb3f8976705ded2738405a536bca25",
       "size": 13715
+    },
+    {
+      "path": "unified/dynamo_v2-0.4.0.tar.gz",
+      "sha256": "09529dd93d31783f75560c14da929582b4a714d0abe930539f1fac03b05d2a16",
+      "size": 13885
     },
     {
       "path": "unified/golden.tar.gz",

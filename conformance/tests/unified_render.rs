@@ -846,9 +846,10 @@ fn committed_dynamo_capture_matches_the_live_parsers() {
     // parsers and must never be mistaken for the live one. Resolving by readdir order
     // instead made this guard nondeterministic — the same commit could pass against one
     // shard and report parser drift against another purely on directory listing order.
-    let capture_dir = common::version_dirs_ascending(&root, "dynamo_v2-")
-        .pop()
-        .expect("no committed dynamo_v2-<ver> capture dir");
+    let capture_dir =
+        common::version_dirs_ascending_with_current(&root, "dynamo_v2-", "dynamo_v2-0.4.0")
+            .pop()
+            .expect("no committed dynamo_v2-<ver> capture dir");
 
     // key -> (family, scenario, input, init), from the inputs shard.
     let mut meta: BTreeMap<(String, String), (String, String, Init)> = BTreeMap::new();
