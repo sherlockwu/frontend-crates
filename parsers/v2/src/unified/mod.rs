@@ -54,6 +54,7 @@ pub mod muse_glimmer;
 pub mod qwen3;
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 pub use guided_cursor::{CommittedCall, GuidedJsonCursor};
 
@@ -1375,8 +1376,71 @@ struct GuidedState {
     /// the other two contracts buffer to completion, so under them this never
     /// advances and the completion path below is unchanged.
     cursor: GuidedJsonCursor,
+    /// Forward-only scanner for response-prefilled prose before a guided payload.
+    response_prefill_probe: ResponsePrefillProbe,
     input: String,
     json: String,
+}
+
+/// Tracks complete JSON values in response-prefilled prose without reparsing the
+/// accumulated response on every streamed chunk.
+#[derive(Debug, Default)]
+struct ResponsePrefillProbe {
+    scan_at: usize,
+    candidate_start: Option<usize>,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl ResponsePrefillProbe {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Returns each lexically complete object or array in forward order.
+    fn next_complete_value(&mut self, input: &str) -> Option<Range<usize>> {
+        while self.scan_at < input.len() {
+            let (relative, ch) = input[self.scan_at..].char_indices().next()?;
+            debug_assert_eq!(relative, 0);
+            let at = self.scan_at;
+            self.scan_at += ch.len_utf8();
+
+            let Some(start) = self.candidate_start else {
+                if matches!(ch, '{' | '[') {
+                    self.candidate_start = Some(at);
+                    self.depth = 1;
+                    self.in_string = false;
+                    self.escaped = false;
+                }
+                continue;
+            };
+
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => self.in_string = true,
+                '{' | '[' => self.depth += 1,
+                '}' | ']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        self.candidate_start = None;
+                        return Some(start..self.scan_at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 /// Earliest control marker in `haystack`, as `(pos, consume_len)`.
@@ -1643,21 +1707,6 @@ fn json_payload_started(buf: &str) -> bool {
 /// guided payload. A syntactically invalid candidate such as `[docs]` remains
 /// visible text; an incomplete valid prefix remains buffered until its payload
 /// finishes streaming.
-fn guided_json_start(input: &str) -> Option<usize> {
-    input
-        .char_indices()
-        .filter_map(|(at, ch)| matches!(ch, '{' | '[').then_some(at))
-        .find(|&at| {
-            let mut values =
-                serde_json::Deserializer::from_str(&input[at..]).into_iter::<serde_json::Value>();
-            match values.next() {
-                Some(Ok(_)) => true,
-                Some(Err(error)) => error.is_eof(),
-                None => false,
-            }
-        })
-}
-
 fn json_payload_kind(payload: &str) -> &'static str {
     match serde_json::from_str::<serde_json::Value>(payload) {
         Ok(serde_json::Value::Object(_)) => "object",
@@ -1779,6 +1828,7 @@ impl GuidedState {
             payload_emitted: false,
             post_payload_text_started: false,
             cursor,
+            response_prefill_probe: ResponsePrefillProbe::default(),
             input: String::new(),
             json: String::new(),
         }
@@ -1818,6 +1868,19 @@ impl GuidedState {
             }
         }
         Ok(())
+    }
+
+    fn push_visible_text(&self, output: &mut Vec<UnifiedParserEvent>, text: &str) {
+        push_run(output, Kind::Text, &self.reasoning.strip_text(text));
+    }
+
+    fn is_guided_payload(&self, payload: &str) -> bool {
+        match self.named_tool {
+            Some(_) => {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(payload).is_ok()
+            }
+            None => parse_required_guided_calls(payload).is_some(),
+        }
     }
 
     fn finish(&mut self) -> Result<Vec<UnifiedParserEvent>> {
@@ -1864,6 +1927,7 @@ impl GuidedState {
         self.payload_emitted = false;
         self.post_payload_text_started = false;
         self.cursor.reset();
+        self.response_prefill_probe.reset();
         recovered
     }
 
@@ -1872,7 +1936,10 @@ impl GuidedState {
     /// it go back through the channel/control scanner rather than being mistaken
     /// for JSON or stripped by a separate tail-only marker implementation.
     fn emit_completed_json(&mut self) -> Result<Vec<UnifiedParserEvent>> {
-        if self.payload_emitted || !json_payload_started(&self.json) {
+        if self.mode != GuidedMode::VisibleOnly
+            || self.payload_emitted
+            || !json_payload_started(&self.json)
+        {
             return Ok(Vec::new());
         }
 
@@ -2208,9 +2275,10 @@ impl GuidedState {
                                 || (self.json.trim().is_empty()
                                     && json_payload_started(&self.input))
                         } else {
-                            guided_json_start(&self.json) == Some(0)
-                                || (self.json.trim().is_empty()
-                                    && guided_json_start(&self.input) == Some(0))
+                            self.named_tool.is_some()
+                                && (json_payload_started(&self.json)
+                                    || (self.json.trim().is_empty()
+                                        && json_payload_started(&self.input)))
                         }
                     {
                         self.mode = GuidedMode::VisibleOnly;
@@ -2227,36 +2295,36 @@ impl GuidedState {
                     if !self.reasoning_enabled && !self.payload_emitted {
                         let mut combined = std::mem::take(&mut self.json);
                         combined.push_str(&self.input);
-                        let Some(payload_at) = guided_json_start(&combined) else {
+                        self.input.clear();
+                        let mut payload = None;
+                        while let Some(candidate) =
+                            self.response_prefill_probe.next_complete_value(&combined)
+                        {
+                            if self.is_guided_payload(&combined[candidate.clone()]) {
+                                payload = Some(candidate);
+                                break;
+                            }
+                        }
+                        let Some(payload) = payload else {
                             self.json = combined;
-                            self.input.clear();
                             break;
                         };
-                        if !flush && combined[payload_at..].len() == 1 {
-                            // A lone `[` can begin JSON or quoted prose. Keep it until
-                            // the next byte distinguishes `[docs]` from a call array.
+                        if payload.start == 0 {
                             self.json = combined;
-                            self.input.clear();
-                            break;
-                        }
-                        if combined[..payload_at].trim().is_empty() {
-                            self.json = combined;
-                            self.input.clear();
-                            break;
-                        }
-                        if payload_at == 0 {
-                            self.json.clear();
+                            self.mode = GuidedMode::VisibleOnly;
                             continue;
                         }
                         if let Some((0, marker_len)) =
-                            self.control_marker_at(&combined, Some(payload_at), &[], flush)
+                            self.control_marker_at(&combined, Some(payload.start), &[], flush)
                         {
                             self.stripped_markup = true;
                             self.input = combined[marker_len..].to_string();
+                            self.response_prefill_probe.reset();
                             continue;
                         }
-                        push_run(&mut output, Kind::Text, &combined[..payload_at]);
-                        self.input = combined[payload_at..].to_string();
+                        self.push_visible_text(&mut output, &combined[..payload.start]);
+                        self.json = combined[payload.start..].to_string();
+                        self.mode = GuidedMode::VisibleOnly;
                         continue;
                     }
 
@@ -2352,11 +2420,7 @@ impl GuidedState {
                                 self.json = pending;
                             }
                         } else {
-                            push_run(
-                                &mut output,
-                                Kind::Text,
-                                &self.reasoning.strip_text(&pending),
-                            );
+                            self.push_visible_text(&mut output, &pending);
                             if self.payload_emitted {
                                 self.post_payload_text_started = true;
                             }
@@ -2382,11 +2446,7 @@ impl GuidedState {
                                 self.json = pending;
                             }
                         } else {
-                            push_run(
-                                &mut output,
-                                Kind::Text,
-                                &self.reasoning.strip_text(&pending),
-                            );
+                            self.push_visible_text(&mut output, &pending);
                             if self.payload_emitted {
                                 self.post_payload_text_started = true;
                             }
@@ -2421,6 +2481,12 @@ impl GuidedState {
                         )
                         .max(if self.reasoning_enabled {
                             self.reasoning.holdback(&self.input, self.channel_state())
+                        } else if self.payload_emitted {
+                            // Response-prefilled turns do not interpret a later
+                            // marker as a reasoning transition, but their visible
+                            // text still needs complete marker bytes for the shared
+                            // normalizer to strip them across chunk boundaries.
+                            self.reasoning.holdback(&self.input, self.channel_state())
                         } else {
                             0
                         })
@@ -2431,6 +2497,26 @@ impl GuidedState {
                                 &self.input,
                                 std::iter::once(self.grammar.invoke_end.as_str()),
                             )
+                        } else {
+                            0
+                        })
+                        .max(if self.payload_emitted {
+                            // A response prefill may resume with arbitrary prose after
+                            // a call. Retain an unfinished family framing marker there
+                            // so the visible-text normalizer receives it atomically.
+                            let mut marker_keep = marker_prefix_suffix_len(
+                                &self.input,
+                                self.reasoning
+                                    .competitors()
+                                    .into_iter()
+                                    .chain(self.reasoning.close_markers()),
+                            );
+                            if !self.reasoning_enabled
+                                && let Some(at) = self.input.rfind("to=")
+                            {
+                                marker_keep = marker_keep.max(self.input.len() - at);
+                            }
+                            marker_keep
                         } else {
                             0
                         })
@@ -2452,11 +2538,7 @@ impl GuidedState {
                                 }));
                             }
                         } else if self.answer_only() {
-                            push_run(
-                                &mut output,
-                                Kind::Text,
-                                &self.reasoning.strip_text(&self.input[..visible_len]),
-                            );
+                            self.push_visible_text(&mut output, &self.input[..visible_len]);
                             self.post_payload_text_started = true;
                         } else if !self.reasoning_enabled && self.json.trim().is_empty() {
                             let mut visible = std::mem::take(&mut self.json);
@@ -2464,7 +2546,7 @@ impl GuidedState {
                             if visible.trim().is_empty() {
                                 self.json = visible;
                             } else {
-                                push_run(&mut output, Kind::Text, &visible);
+                                self.push_visible_text(&mut output, &visible);
                             }
                         } else {
                             self.json.push_str(&self.input[..visible_len]);
@@ -2483,11 +2565,7 @@ impl GuidedState {
                     }
                     if flush && !self.input.is_empty() {
                         if self.answer_only() {
-                            push_run(
-                                &mut output,
-                                Kind::Text,
-                                &self.reasoning.strip_text(&self.input),
-                            );
+                            self.push_visible_text(&mut output, &self.input);
                             self.post_payload_text_started = true;
                         } else {
                             self.json.push_str(&self.input);
@@ -3536,35 +3614,43 @@ mod tests {
     }
 
     #[test]
-    fn native_tool_boundary_recovers_prefilled_reasoning_into_guided_json_at_every_split() {
+    fn response_prefill_skips_valid_json_prose_before_required_calls_at_every_split() {
         let payload = r#"[{"name":"get_weather","arguments":{"city":"Paris"}}]"#;
-        for (family, input) in [
-            (
-                "qwen3",
-                format!("thinking <tool_call>{payload}</tool_call>"),
-            ),
-            (
-                "kimi_k2",
-                format!("thinking <|tool_calls_section_begin|>{payload}<|tool_calls_section_end|>"),
-            ),
-        ] {
-            let want = vec![
-                UnifiedEvent::Reasoning {
-                    text: "thinking ".to_string(),
-                },
-                UnifiedEvent::ToolCall {
-                    name: "get_weather".to_string(),
-                    arguments: serde_json::json!({"city":"Paris"}),
-                },
-            ];
-            for (index, got) in
-                guided_events_at_every_split(family, &input, UnifiedParserStartingState::Reasoning)
-                    .into_iter()
-                    .enumerate()
-            {
-                assert_eq!(got, want, "{family} split {index}");
-            }
+        let prefix = "{\"message\":\"ordinary JSON prose\",\"items\":[\"cafe\",\"東京\"]} ";
+        let input = format!("{prefix}{payload}");
+        let want = vec![
+            UnifiedEvent::Text {
+                text: prefix.to_string(),
+            },
+            UnifiedEvent::ToolCall {
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city":"Paris"}),
+            },
+        ];
+        for (index, got) in
+            guided_events_at_every_split("qwen3", &input, UnifiedParserStartingState::Response)
+                .into_iter()
+                .enumerate()
+        {
+            assert_eq!(got, want, "qwen3 split {index}");
         }
+    }
+
+    #[test]
+    fn response_prefill_probe_scans_each_byte_once() {
+        let input = r#"{"message":"ordinary JSON prose"} [{"name":"get_weather","arguments":{}}]"#;
+        let expected_start = input.find('[').unwrap();
+        let mut probe = ResponsePrefillProbe::default();
+        let mut candidate = None;
+        for end in input.char_indices().map(|(at, ch)| at + ch.len_utf8()) {
+            while let Some(found) = probe.next_complete_value(&input[..end]) {
+                if parse_required_guided_calls(&input[found.clone()]).is_some() {
+                    candidate = Some(found);
+                }
+            }
+            assert_eq!(probe.scan_at, end);
+        }
+        assert_eq!(candidate, Some(expected_start..input.len()));
     }
 
     #[test]

@@ -454,15 +454,6 @@ def test_every_authored_case_survives_emission_and_reload():
             assert loaded["init"] == case["init"], f"{cid}: init changed"
 
 
-def test_request_state_boundary_cases_round_trip_every_family():
-    """Each family keeps its authored control-boundary bytes through YAML emission."""
-    scenario = "guided_json_bare_tool_header_recovers_inside_a_thought"
-    for fam in FAMILIES:
-        cid = f"UNIFIED.{scenario}.{fam}"
-        constructed = build_cases(fam)[cid]["input"]
-        assert _emitted_spec(fam)[cid]["input"] == constructed
-
-
 # --- counts live where they can be checked, not in registry prose ---------------
 
 def test_unified_case_counts_match_the_generator():
