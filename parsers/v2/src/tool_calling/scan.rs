@@ -1252,6 +1252,7 @@ pub(crate) mod test_support {
                 tool_index,
                 name: Some("ok".to_string()),
                 arguments: "{}".to_string(),
+                complete: true,
             }))
         }
     }

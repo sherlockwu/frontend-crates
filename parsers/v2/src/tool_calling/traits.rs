@@ -30,8 +30,7 @@ pub struct Tool {
     pub strict: Option<bool>,
 }
 
-// Mirrors vLLM Rust `ToolCallDelta` verbatim; serving layers mint IDs outside the
-// parser core.
+// Aligned with vLLM Rust `ToolCallDelta`; `complete` is Dynamo's lifecycle extension.
 /// One tool-call update emitted while parsing assistant text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallDelta {
@@ -41,6 +40,8 @@ pub struct ToolCallDelta {
     pub name: Option<String>,
     /// Arguments text contributed by this update.
     pub arguments: String,
+    /// Whether this delta completes a validated call.
+    pub complete: bool,
 }
 
 // Mirrors vLLM Rust `ToolParseResult` verbatim.
@@ -72,22 +73,22 @@ impl ToolParseResult {
     /// This is primarily used by test helpers and batch adapters that delegate
     /// through the incremental parser lifecycle.
     pub fn coalesce_calls(mut self) -> Self {
-        let mut merged = BTreeMap::<usize, (ToolCallDelta, usize)>::new();
+        let mut merged = BTreeMap::<usize, ToolCallDelta>::new();
         let mut order = Vec::new();
 
         for call in self.calls {
             match merged.entry(call.tool_index) {
                 btree_map::Entry::Vacant(entry) => {
                     order.push(call.tool_index);
-                    entry.insert((call, 1));
+                    entry.insert(call);
                 }
                 btree_map::Entry::Occupied(mut entry) => {
-                    let (existing, fragments) = entry.get_mut();
+                    let existing = entry.get_mut();
                     if existing.name.is_none() {
                         existing.name = call.name;
                     }
-                    *fragments += 1;
                     existing.arguments.push_str(&call.arguments);
+                    existing.complete |= call.complete;
                 }
             }
         }
@@ -95,12 +96,7 @@ impl ToolParseResult {
         self.calls = order
             .into_iter()
             .filter_map(|tool_index| merged.remove(&tool_index))
-            .filter(|(call, fragments)| {
-                *fragments == 1
-                    || !call.arguments.starts_with('{')
-                    || serde_json::from_str::<Value>(&call.arguments).is_ok()
-            })
-            .map(|(call, _)| call)
+            .filter(|call| call.complete)
             .collect();
         self
     }

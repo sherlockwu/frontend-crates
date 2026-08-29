@@ -109,11 +109,13 @@ impl InvokeEmitter for Qwen3Emitter {
         let Some(value) = invoke.get(partial.value_start + partial.emitted_raw..) else {
             return Ok(None);
         };
-        let value = value
-            .find("</parameter>")
-            .map(|end| &value[..end])
-            .unwrap_or(value);
-        let safe_end = value.len() - marker_prefix_suffix_len(value, ["</parameter>"]);
+        let (value, parameter_closed) = ["</parameter>", FUNCTION_END]
+            .into_iter()
+            .filter_map(|marker| value.find(marker).map(|end| (end, marker)))
+            .min_by_key(|(end, _)| *end)
+            .map(|(end, _)| (&value[..end], true))
+            .unwrap_or((value, false));
+        let safe_end = value.len() - qwen_partial_suffix_len(value);
         let safe = &value[..safe_end];
         let entity = safe.find('&').unwrap_or(safe.len());
         let safe = &safe[..entity];
@@ -161,19 +163,21 @@ impl InvokeEmitter for Qwen3Emitter {
                         .to_string(),
                 ),
                 arguments: partial.emitted_json.clone(),
+                complete: false,
             }));
         }
         let escaped = json_string_fragment(raw);
         partial.emitted_raw += leading + end;
         let arguments = escaped.clone();
         partial.emitted_json.push_str(&escaped);
-        if entity < safe_end {
+        if entity < safe_end || parameter_closed {
             partial.stopped = true;
         }
         Ok(Some(ToolCallDelta {
             tool_index,
             name: None,
             arguments,
+            complete: false,
         }))
     }
 
@@ -217,6 +221,7 @@ impl InvokeEmitter for Qwen3Emitter {
             // only the argument suffix, matching OpenAI delta semantics.
             name: (!streamed).then_some(call.function.name),
             arguments,
+            complete: true,
         }))
     }
 
@@ -273,6 +278,12 @@ fn first_streamable_string_parameter(
 fn json_string_fragment(text: &str) -> String {
     let encoded = serde_json::to_string(text).expect("serializing a string cannot fail");
     encoded[1..encoded.len() - 1].to_string()
+}
+
+/// Keep a native function-close prefix out of an open parameter value without
+/// exposing it to the shared guided-decoding marker vocabulary.
+fn qwen_partial_suffix_len(value: &str) -> usize {
+    marker_prefix_suffix_len(value, ["</parameter>", FUNCTION_END])
 }
 
 /// Stream parser for Qwen3-Coder XML tool calls.
@@ -585,6 +596,12 @@ mod tests {
             "content must stream with substantial value remaining: {during_value:?}"
         );
         let out = stream_every_char(&weather_tools(), input);
+        assert_eq!(
+            out.calls.iter().filter(|call| call.name.is_some()).count(),
+            1,
+            "Qwen must put the name on the first update only"
+        );
+        assert!(out.calls.last().expect("call updates").complete);
         let fragments: Vec<_> = out
             .calls
             .iter()

@@ -297,6 +297,7 @@ impl Gemma4ToolStreamParser {
             tool_index: self.next_index,
             name: Some(call.function.name),
             arguments,
+            complete: true,
         });
         self.next_index += 1;
         Ok(())

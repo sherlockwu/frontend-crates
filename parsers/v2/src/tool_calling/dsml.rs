@@ -90,11 +90,13 @@ impl DeepSeekV4ToolStreamParser {
                     tool_index,
                     name: Some(name),
                     arguments: String::new(),
+                    complete: true,
                 });
                 out.calls.push(ToolCallDelta {
                     tool_index,
                     name: None,
                     arguments,
+                    complete: true,
                 });
                 self.next_index += 1;
                 self.open_invoke = None;

@@ -236,6 +236,7 @@ fn stream_result_to_parser_output(r: ToolStreamResult) -> ToolParseResult {
                     .as_ref()
                     .and_then(|f| f.arguments.clone())
                     .unwrap_or_default(),
+                complete: true,
             })
             .collect(),
     }

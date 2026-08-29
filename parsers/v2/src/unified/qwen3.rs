@@ -2651,6 +2651,7 @@ mod guided_warning_tests {
                     tool_index: 0,
                     name: Some("get_weather".into()),
                     arguments: format!(r#"{{"api_key":"{ARGUMENT_SECRET}""#),
+                    complete: true,
                 },
             )]);
         });

@@ -600,18 +600,18 @@ pub fn assemble(deltas: &[UnifiedParserEvent]) -> Vec<UnifiedEvent> {
     // fragments of two interleaved calls cannot merge, and carrying each call's
     // position so it stays where its FIRST delta landed.
     let mut out: Vec<UnifiedEvent> = Vec::new();
-    let mut calls: BTreeMap<usize, (usize, String, usize)> = BTreeMap::new();
+    let mut calls: BTreeMap<usize, (usize, String, bool)> = BTreeMap::new();
     for delta in merged {
         match delta {
             UnifiedParserEvent::Reasoning(text) => out.push(UnifiedEvent::Reasoning { text }),
             UnifiedParserEvent::Text(text) => out.push(UnifiedEvent::Text { text }),
             UnifiedParserEvent::ToolCall(call) => {
-                let (pos, raw, fragments) = calls.entry(call.tool_index).or_insert_with(|| {
+                let (pos, raw, complete) = calls.entry(call.tool_index).or_insert_with(|| {
                     out.push(UnifiedEvent::ToolCall {
                         name: String::new(),
                         arguments: serde_json::Value::Null,
                     });
-                    (out.len() - 1, String::new(), 0)
+                    (out.len() - 1, String::new(), false)
                 });
                 raw.push_str(&call.arguments);
                 if let Some(incoming) = call.name
@@ -620,17 +620,14 @@ pub fn assemble(deltas: &[UnifiedParserEvent]) -> Vec<UnifiedEvent> {
                 {
                     *name = incoming;
                 }
-                *fragments += 1;
+                *complete |= call.complete;
             }
         }
     }
 
     let mut incomplete_positions = Vec::new();
-    for (pos, raw, fragments) in calls.into_values() {
-        if fragments > 1
-            && raw.starts_with('{')
-            && serde_json::from_str::<serde_json::Value>(&raw).is_err()
-        {
+    for (pos, raw, complete) in calls.into_values() {
+        if !complete {
             incomplete_positions.push(pos);
             continue;
         }
@@ -2390,6 +2387,7 @@ impl GuidedState {
                                     tool_index: 0,
                                     name: None,
                                     arguments: self.input[..visible_len].to_string(),
+                                    complete: false,
                                 }));
                             }
                         } else if self.answer_only() {
@@ -2700,6 +2698,7 @@ impl GuidedState {
                         tool_index: index,
                         name: None,
                         arguments: String::new(),
+                        complete: true,
                     }));
                 }
                 // Valid but never committed — a parameterless call, or one whose
@@ -2709,6 +2708,7 @@ impl GuidedState {
                         tool_index: index,
                         name: Some(call.name),
                         arguments: call.arguments,
+                        complete: true,
                     }));
                 }
                 // Invalid, and nothing went out for it: recover just this element.
@@ -2957,6 +2957,7 @@ impl GuidedState {
                     tool_index,
                     name: Some(call.name),
                     arguments: call.arguments,
+                    complete: true,
                 })
             })
             .collect())
@@ -3413,6 +3414,7 @@ mod tests {
             tool_index,
             name: name.map(str::to_string),
             arguments: arguments.to_string(),
+            complete: true,
         })
     }
 
@@ -3630,6 +3632,30 @@ mod tests {
     }
 
     #[test]
+    fn assemble_keeps_a_malformed_completed_multi_fragment_call() {
+        let mut first = match call(0, Some("f"), r#"{"x":"#) {
+            UnifiedParserEvent::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        first.complete = false;
+        let mut second = match call(0, None, "broken") {
+            UnifiedParserEvent::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        second.complete = true;
+        assert_eq!(
+            assemble(&[
+                UnifiedParserEvent::ToolCall(first),
+                UnifiedParserEvent::ToolCall(second),
+            ]),
+            vec![UnifiedEvent::ToolCall {
+                name: "f".into(),
+                arguments: serde_json::json!({}),
+            }]
+        );
+    }
+
+    #[test]
     fn tool_only_projection_drops_order_but_not_bytes() {
         let result = ToolParseResult::from_deltas(vec![
             UnifiedParserEvent::Reasoning("a".into()),
@@ -3776,6 +3802,7 @@ mod parse_into_recovery_tests {
             tool_index: index,
             name: Some("ok".to_string()),
             arguments: "{}".to_string(),
+            complete: true,
         })
     }
 
