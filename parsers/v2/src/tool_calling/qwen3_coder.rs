@@ -151,7 +151,14 @@ impl InvokeEmitter for Qwen3Emitter {
         if end == 0 {
             return Ok(None);
         }
-        let raw = &value[leading..leading + end];
+        let end = value
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(value.len()))
+            .take_while(|index| *index <= leading + end)
+            .last()
+            .expect("empty value handled above");
+        let raw = &value[leading..end];
         if !partial.header_emitted {
             partial.header_emitted = true;
             return Ok(Some(ToolCallDelta {
@@ -167,7 +174,7 @@ impl InvokeEmitter for Qwen3Emitter {
             }));
         }
         let escaped = json_string_fragment(raw);
-        partial.emitted_raw += leading + end;
+        partial.emitted_raw += end;
         let arguments = escaped.clone();
         partial.emitted_json.push_str(&escaped);
         if entity < safe_end || parameter_closed {
@@ -618,6 +625,22 @@ mod tests {
             "parameter marker leaked into arguments: {fragments:?}"
         );
         assert_eq!(out.coalesce_calls(), baseline);
+    }
+
+    #[test]
+    fn holds_an_incomplete_east_asian_codepoint_until_it_is_whole() {
+        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
+        let prefix = "<tool_call><function=get_weather><parameter=location>東";
+        let first = parser.push(prefix).expect("first push");
+        assert!(first.calls.iter().any(|call| call.name.is_some()));
+        let second = parser
+            .push("京</parameter></function></tool_call>")
+            .expect("second push");
+        let mut out = first;
+        out.append(second);
+        out.append(parser.finish().expect("finish"));
+        let merged = out.coalesce_calls();
+        assert_eq!(merged.calls[0].arguments, r#"{"location":"東京"}"#);
     }
 
     #[test]
