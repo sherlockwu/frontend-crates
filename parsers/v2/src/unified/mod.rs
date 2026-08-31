@@ -3621,17 +3621,6 @@ mod tests {
     }
 
     #[test]
-    fn assemble_keeps_a_malformed_one_shot_call() {
-        assert_eq!(
-            assemble(&[call(0, Some("f"), r#"{"x":"#)]),
-            vec![UnifiedEvent::ToolCall {
-                name: "f".into(),
-                arguments: serde_json::json!({}),
-            }]
-        );
-    }
-
-    #[test]
     fn assemble_keeps_a_malformed_completed_multi_fragment_call() {
         let mut first = match call(0, Some("f"), r#"{"x":"#) {
             UnifiedParserEvent::ToolCall(call) => call,

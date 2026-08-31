@@ -210,6 +210,27 @@ impl InvokeEmitter for Qwen3Emitter {
         let streamed = partial
             .as_ref()
             .is_some_and(|partial| partial.header_emitted);
+        if streamed
+            && partial
+                .as_ref()
+                .is_some_and(|partial| !arguments.starts_with(&partial.emitted_json))
+        {
+            // Duplicate parameters use last-write-wins in the batch parser. Once
+            // the first value has reached a streaming consumer, the later value
+            // cannot be retracted without assembling corrupted JSON, so leave
+            // this call incomplete and let the normal coalescer discard it.
+            tracing::warn!(
+                why = "qwen_streamed_call_invalidated_by_duplicate_parameter",
+                tool_index,
+                "streamed Qwen arguments no longer match the completed call"
+            );
+            return Ok(Some(ToolCallDelta {
+                tool_index,
+                name: None,
+                arguments: String::new(),
+                complete: false,
+            }));
+        }
         let arguments = if let Some(partial) = &partial {
             if streamed
                 && partial.tool_index == tool_index
@@ -543,6 +564,24 @@ mod tests {
             out.calls[0].arguments,
             r#"{"path":"/app/x.go","old_str":"foo","new_str":"bar","command":"str_replace"}"#
         );
+    }
+
+    #[test]
+    fn duplicate_streamed_parameter_does_not_assemble_corrupted_arguments() {
+        let input = "<tool_call><function=get_weather><parameter=location>Paris</parameter><parameter=location>London</parameter></function></tool_call>";
+        let first_parameter_end = input.find("<parameter=location>London").unwrap();
+        let out = parse_chunks(
+            &weather_tools(),
+            &[&input[..first_parameter_end], &input[first_parameter_end..]],
+        );
+        let assembled = out.clone().coalesce_calls();
+        assert!(
+            assembled.calls.is_empty(),
+            "streamed duplicate parameter assembled mismatched JSON: {out:?}"
+        );
+
+        let complete = parse_chunks(&weather_tools(), &[input]).coalesce_calls();
+        assert_eq!(complete.calls[0].arguments, r#"{"location":"London"}"#);
     }
 
     fn stream_every_char(tools: &[Tool], input: &str) -> ToolParseResult {
