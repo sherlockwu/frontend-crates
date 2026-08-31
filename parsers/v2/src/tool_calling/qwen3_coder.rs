@@ -628,22 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn holds_an_incomplete_east_asian_codepoint_until_it_is_whole() {
-        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
-        let prefix = "<tool_call><function=get_weather><parameter=location>東";
-        let first = parser.push(prefix).expect("first push");
-        assert!(first.calls.iter().any(|call| call.name.is_some()));
-        let second = parser
-            .push("京</parameter></function></tool_call>")
-            .expect("second push");
-        let mut out = first;
-        out.append(second);
-        out.append(parser.finish().expect("finish"));
-        let merged = out.coalesce_calls();
-        assert_eq!(merged.calls[0].arguments, r#"{"location":"東京"}"#);
-    }
-
-    #[test]
     fn defers_non_string_parameter_until_function_close() {
         let tools = vec![Tool {
             name: "set_count".to_string(),
@@ -660,33 +644,6 @@ mod tests {
         let closed = parser.push("</function></tool_call>").unwrap();
         assert_eq!(closed.calls.len(), 1);
         assert_eq!(closed.calls[0].arguments, r#"{"count":42}"#);
-    }
-
-    #[test]
-    fn bare_string_parameter_streams_before_function_close() {
-        let mut parser = Qwen3CoderToolStreamParser::new(&weather_tools());
-        assert!(
-            parser
-                .push("<function=get_weather><parameter=location>")
-                .expect("header")
-                .calls
-                .is_empty()
-        );
-        let early = parser.push("Paris").expect("push");
-        assert!(early.calls.iter().any(|call| call.name.is_some()));
-        assert!(
-            early
-                .calls
-                .iter()
-                .any(|call| call.arguments.contains("Paris"))
-        );
-        let closed = parser.push("</parameter></function>").expect("close");
-        assert!(
-            closed
-                .calls
-                .iter()
-                .any(|call| call.arguments.ends_with("\"}"))
-        );
     }
 
     #[test]

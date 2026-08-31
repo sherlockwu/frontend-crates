@@ -295,7 +295,7 @@ fn assemble_trait_calls(result: ToolParseResult) -> Vec<(String, Value)> {
     }
     names
         .into_iter()
-        .map(|(idx, name)| {
+        .filter_map(|(idx, name)| {
             let raw = args.remove(&idx).unwrap_or_default();
             if complete.get(&idx) != Some(&true) {
                 return None;
@@ -303,6 +303,5 @@ fn assemble_trait_calls(result: ToolParseResult) -> Vec<(String, Value)> {
             let value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
             Some((name, value))
         })
-        .flatten()
         .collect()
 }
