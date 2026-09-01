@@ -232,8 +232,8 @@ pub fn fixture_name(path: &Path) -> String {
         .to_string()
 }
 
-/// Branch-only Qwen stream capture. Generic capture discovery excludes every `+tag`.
-pub const STREAM_DYNAMO_V2_CURRENT_CAPTURE: &str = "dynamo_v2-0.3.4+current";
+/// Current parser-version capture used by stream parity and interleave tests.
+pub const STREAM_DYNAMO_V2_CURRENT_CAPTURE: &str = "dynamo_v2-0.4.0";
 
 /// Version-sorted capture dirs for one impl prefix (e.g. `dynamo-` under
 /// fixtures-batch-v1, `dynamo_v2-` under fixtures-stream-v2), ASCENDING by
@@ -290,7 +290,7 @@ pub fn version_dirs_ascending_with_current(
 ) -> Vec<PathBuf> {
     let mut dirs = version_dirs_ascending(root, prefix);
     let current = root.join(current_dir);
-    if current.is_dir() {
+    if current.is_dir() && !dirs.contains(&current) {
         dirs.push(current);
     }
     dirs

@@ -1,6 +1,6 @@
 {
-  "snapshot": "20260828_184836",
-  "created_pt": "2026-08-28 18:48:36 America/Los_Angeles",
+  "snapshot": "20260831_152117",
+  "created_pt": "2026-08-31 15:21:17 America/Los_Angeles",
   "crates": {
     "dynamo-parsers": "8.2.0",
     "dynamo-parsers-v2": "0.4.0"
@@ -126,6 +126,11 @@
       "size": 6811
     },
     {
+      "path": "toolcalling/fixtures-stream-v2/dynamo_v2-0.4.0.tar.gz",
+      "sha256": "ad8300b9af05bbf4abcfa6f6ce152388a1215a2034408e80d74b20ddea324317",
+      "size": 6767
+    },
+    {
       "path": "toolcalling/fixtures-stream-v2/inputs.tar.gz",
       "sha256": "90ec091c899366ea4c668fec3de33c722ba06c35d3aa4556b31e7fbb0b1de218",
       "size": 40660
@@ -242,8 +247,8 @@
     },
     {
       "path": "unified/dynamo_v2-0.4.0.tar.gz",
-      "sha256": "09529dd93d31783f75560c14da929582b4a714d0abe930539f1fac03b05d2a16",
-      "size": 13885
+      "sha256": "ea80d9711de5f577fe4cfa9407af85ad335724762156ec0065be82fd8e2cad06",
+      "size": 13782
     },
     {
       "path": "unified/golden.tar.gz",

@@ -245,6 +245,11 @@ fn diff_chunk(input: ChunkDiff<'_>, failures: &mut Vec<String>) {
                 got.arguments, want.arguments
             ));
         }
+        if let Some(complete) = want.complete
+            && got.complete != complete
+        {
+            errs.push(format!("complete {} != {}", got.complete, complete));
+        }
         if !errs.is_empty() {
             failures.push(format!(
                 "{} {} chunk[{}] delta[{i}]: {}",

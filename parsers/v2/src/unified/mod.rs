@@ -648,10 +648,25 @@ pub fn assemble(deltas: &[UnifiedParserEvent]) -> Vec<UnifiedEvent> {
             });
         }
     }
-    for pos in incomplete_positions.into_iter().rev() {
+    incomplete_positions.sort_unstable_by(|left, right| right.cmp(left));
+    for pos in incomplete_positions {
         out.remove(pos);
     }
-    out
+    let mut recoalesced = Vec::with_capacity(out.len());
+    for event in out {
+        match (recoalesced.last_mut(), event) {
+            (
+                Some(UnifiedEvent::Text { text: existing }),
+                UnifiedEvent::Text { text: incoming },
+            ) => existing.push_str(&incoming),
+            (
+                Some(UnifiedEvent::Reasoning { text: existing }),
+                UnifiedEvent::Reasoning { text: incoming },
+            ) => existing.push_str(&incoming),
+            (_, event) => recoalesced.push(event),
+        }
+    }
+    recoalesced
 }
 
 /// The two payload kinds that carry a text run and coalesce when adjacent (`I8`).
@@ -3640,6 +3655,46 @@ mod tests {
             vec![UnifiedEvent::ToolCall {
                 name: "f".into(),
                 arguments: serde_json::json!({}),
+            }]
+        );
+    }
+
+    #[test]
+    fn assemble_removes_reverse_indexed_incomplete_calls_without_panicking() {
+        let mut index_one = match call(1, Some("second"), r#"{"x":"#) {
+            UnifiedParserEvent::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        index_one.complete = false;
+        let mut index_zero = match call(0, Some("first"), r#"{"y":"#) {
+            UnifiedParserEvent::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        index_zero.complete = false;
+        assert!(
+            assemble(&[
+                UnifiedParserEvent::ToolCall(index_one),
+                UnifiedParserEvent::ToolCall(index_zero),
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn assemble_recoalesces_text_after_removing_an_incomplete_call() {
+        let mut incomplete = match call(0, Some("f"), r#"{"x":"#) {
+            UnifiedParserEvent::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        incomplete.complete = false;
+        assert_eq!(
+            assemble(&[
+                UnifiedParserEvent::Text("before".into()),
+                UnifiedParserEvent::ToolCall(incomplete),
+                UnifiedParserEvent::Text("after".into()),
+            ]),
+            vec![UnifiedEvent::Text {
+                text: "beforeafter".into()
             }]
         );
     }
